@@ -1,0 +1,380 @@
+/*
+ * AVR_SPI_LCD.c
+ *
+ * Created: 6/21/2022 4:03:46 PM
+ * Author : SNATERM1
+ */ 
+
+#define F_CPU 1000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <string.h>
+#include <avr/interrupt.h>
+#include <stdio.h>
+
+enum screenState{HOME,MANUAL,TIMED,FREQ};				// STATE VARIABLE FOR MENU SCREEN TRACKING
+enum cursorState{OPT1,OPT2,OPT3,OPT4,OPT5,OPT6};		// STATE VARIABLE FOR CURSOR LOCATION TRACKING
+enum buttonState{PRESSED, NOT_PRESSED};					// STATE VARIABLE FOR BUTTON DEBOUNCE
+
+enum cursorState cursorLocation = OPT1;					// STATES ARE GLOBAL SO THAT VARIOUS FUNCTIONS WILL ALWAYS KNOW THEIR NAME
+enum buttonState optionButton = NOT_PRESSED;
+enum buttonState selectButton = NOT_PRESSED;
+enum screenState screen = HOME;
+
+int counter  = 1000;									// COUNTERS FOR POLLING BUTTON DEBOUNCE				
+int counter2 = 1000;
+
+void write(char data)				// MCU SPECIFIC SPI BYTE SENDING PROTOCOL
+{
+	PORTB &= ~(1<<PB2);				// PULL SS LOW  - START
+	SPDR = data;					// SEND DATA TO REGISTER
+	while(!(SPSR & (1<<SPIF)));		// WAIT UNTIL TRANSFER COMPLETE FLAG
+	PORTB |= (1<<PB2);				// SET SS HIGH	- STOP
+}
+
+void write_str(char *string)			// FOR MY OWN EASE OF USE
+{
+	PORTB &= ~(1<<PB2);					// PULL SS LOW  - START
+	uint8_t length = strlen(string);	// DEFINE LENGTH OF STRING
+	for(int i = 0; i < length; i++){	// ITERATE THOUGH STRING
+		SPDR = string[i];				// SEND i -TH CHARACTER BYTE
+		while(!(SPSR & (1<<SPIF)));		// WAIT UNTIL TRANSFER COMPLETE FLAG
+	}
+	PORTB |= (1<<PB2);					// SET SS HIGH	- STOP
+}
+
+void clear_screen(void)					// LCD SPECIFIC PROTOCOL FOR CLEARING SCREEN
+{
+	write(0xFE);
+	write(0x51);	// THIS COMMAND TAKES 1.5 mS
+	_delay_ms(2);	// THIS DELAY IS CRUCIAL
+}
+
+void set_cursor(char byte)
+{
+	write(0xFE);
+	write(0x45);	// SET CURSOR COMMAND
+	write(byte);	// LOCATION BYTE - LCD DEFINED
+}
+
+/**********************************************************************************************************
+SET CURSOR OPTION - THIS FUNCTION MOVES THE CURSOR TO A SPECIFIC LOCATION AND THEN UPDATES THE STATE VARAIBLE 
+'cursorLocation'. 
+**********************************************************************************************************/
+void set_cursor_option(uint8_t num)	
+{
+	switch (num)
+	{
+	case 1:
+		write(0xFE);
+		write(0x45);				// SET CURSOR
+		write(0x49);				// OPTION 1
+		cursorLocation = OPT1;		// TRACK STATE OF CURSOR - 0
+		break;
+	case 2:
+		write(0xFE);
+		write(0x45);				// SET CURSOR
+		write(0x1D);				// OPTION 2
+		cursorLocation = OPT2;		// TRACK STATE OF CURSOR - 1
+		break;
+	case 3:
+		write(0xFE);
+		write(0x45);				// SET CURSOR
+		write(0x5D);				// OPTION 3
+		cursorLocation = OPT3;		// TRACK STATE OF CURSOR - 2
+		break;
+	case 4:
+		write(0xFE);
+		write(0x45);				// SET CURSOR
+		write(0x53);				// OPTION 4
+		cursorLocation = OPT4;		// TRACK STATE OF CURSOR - 3
+		break;
+	case 5:
+		write(0xFE);
+		write(0x45);				// SET CURSOR
+		write(0x27);				// OPTION 5
+		cursorLocation = OPT5;		// TRACK STATE OF CURSOR - 4
+		break;
+	case 6:
+		write(0xFE);
+		write(0x45);				// SET CURSOR
+		write(0x67);				// OPTION 6
+		cursorLocation = OPT6;		// TRACK STATE OF CURSOR - 5
+		break;
+	}
+		
+}
+
+void io_init(void)
+{
+	// SET UP OPTION SCROLL BUTTON [D2]
+	DDRD &= ~(1<<DDD2);		// PD2 AS INPUT
+	PORTD |= (1<<PD2);		// ACTIVATE PULLUP RESISTOR
+
+	// SET UP OPTION SELECT BUTTON [C5]
+	DDRC &= ~(1<<DDC5);		// PC5 AS INPUT
+	PORTC |= (1<<PC5);		// PULL UP RESISTOR
+	
+	// TESTING LED
+	DDRD |= (1<<DDD0);		// PD0 OUTPUT
+	DDRD |= (1<<DDD1);		// PD1 OUTPUT
+}
+
+void home_screen(void)
+{
+	write_str("HOME:");
+	set_cursor(0x40);	//START OF LINE 2
+	write_str("MANUAL");
+	set_cursor(0x14);	//START OF LINE 3
+	write_str("TIMED");
+	set_cursor(0x54);	//START OF LINE 4
+	write_str("FREQ");
+	set_cursor_option(1);	// DEFAULT CURSOR LOCATION
+	screen = HOME;
+}
+
+void manual_screen(void)
+{
+	write_str("MANUAL:");
+	set_cursor(0x40);	// START OF LINE 2
+	write_str("ENGAGE");
+	set_cursor(0x14);	//START OF LINE 3
+	write_str("HOME");
+	set_cursor_option(1);	// DEFAULT CURSOR LOCATION
+	screen = MANUAL;
+}
+
+void timed_screen(void)
+{
+	write_str("TIMED:");
+	set_cursor(0x40);	// START OF LINE 2
+	write_str("ENGAGE");
+	set_cursor(0x14);	//START OF LINE 3
+	write_str("HOME");
+	set_cursor_option(1);	// DEFAULT CURSOR LOCATION
+	screen = TIMED;
+}
+
+void init_lcd(void)
+{
+	//INITIALIZE SPI PINS
+	DDRB |= ((1<<DDB2) | (1<<DDB3) | (1<<DDB5)); // SS - MOSI - SCK ALL AS OUTPUT
+	
+	//PRR &= ~(1<<PRSPI);	// LOWER POWER ENABLE - PRR.PRSPI0 MUST BE WRITTEN '0'
+	
+	//INITIALIZE SPCR
+	SPCR = ((1<<SPE)|(1<<MSTR)|(1<<CPOL)|(1<<CPHA)|(1<<SPR0));  // SPI enable, Master, f/16
+	
+	PORTB |= (1<<PB2);				// SET SS HIGH	- STOP
+	_delay_ms(1);
+	clear_screen();
+	
+	write(0xFE);
+	write(0x4B);	// BINKING CURSOR
+	home_screen();
+}
+
+void freq_select_screen(void)
+{
+	write_str("SELECT FREQUENCY:");
+	set_cursor(0x40);	// START OF LINE 2
+	write_str("1 Hz");
+	set_cursor(0x14);	//START OF LINE 3
+	write_str("2 Hz");
+	set_cursor(0x54);	// START OF LINE 4
+	write_str("3 Hz");
+	set_cursor(0x4A);	// START OF LINE 2b
+	write_str("4 Hz");
+	set_cursor(0x1E);	//START OF LINE 3b
+	write_str("5 Hz");
+	set_cursor(0x5E);	// START OF LINE 4b
+	write_str("HOME");
+	set_cursor_option(1);	// DEFAULT CURSOR LOCATION
+	screen = FREQ;
+}
+/********************************************************************************************************************************
+The screen select function starts when a user selection is made. Its output depends on the current screen state.
+As well as the location of the option cursor state.
+*********************************************************************************************************************************/
+void screen_select(uint8_t val)
+{	
+	clear_screen();
+	switch (val) {
+		case 0:  //IF SCREEN WAS HOME
+			if (cursorLocation == OPT1) {
+				manual_screen();
+			} else if (cursorLocation == OPT2) {
+				timed_screen();
+			} else if (cursorLocation == OPT3) {
+				freq_select_screen();
+			} else {
+				home_screen();
+			}
+			break;
+		case 1:	// IF SCREEN WAS MANUAL
+			if (cursorLocation == OPT1) {
+				PORTD |= (1<<PD0);
+				_delay_ms(1000);
+				PORTD &= ~(1<<PD0);
+				manual_screen();
+			} else if (cursorLocation == OPT2) {
+				home_screen();
+			} else {
+				home_screen();
+			}
+			break;
+		case 2: // IF SCREEN WAS TIMED
+			if (cursorLocation == OPT1) {
+				PORTD |= (1<<PD1);
+				_delay_ms(500);
+				PORTD &= ~(1<<PD1);
+				timed_screen();
+			} else if (cursorLocation == OPT2) {
+				home_screen();
+			} else {
+				home_screen();
+			}
+			break;
+		case 3: // IF SCREEN WAS FREQ
+			if (cursorLocation == OPT1) {
+				for (int i = 0; i < 2; i++) {
+					PORTD |= (1<<PD1);
+					_delay_ms(500);
+					PORTD &= ~(1<<PD1);
+					_delay_ms(500);
+				}
+				freq_select_screen();
+			} else if (cursorLocation == OPT2) {
+				for (int i = 0; i < 4; i++) {
+					PORTD |= (1<<PD1);
+					_delay_ms(250);
+					PORTD &= ~(1<<PD1);
+					_delay_ms(250);
+				}
+				freq_select_screen();
+			} else if (cursorLocation == OPT3){
+				for (int i = 0; i < 6; i++) {
+					PORTD |= (1<<PD1);
+					_delay_ms(166);
+					PORTD &= ~(1<<PD1);
+					_delay_ms(166);
+				}
+				freq_select_screen();
+			} else if (cursorLocation == OPT4) {
+				for (int i = 0; i < 8; i++) {
+					PORTD |= (1<<PD1);
+					_delay_ms(125);
+					PORTD &= ~(1<<PD1);
+					_delay_ms(125);
+				}
+				freq_select_screen();
+			} else if (cursorLocation == OPT5) {
+				for (int i = 0; i < 10; i++) {
+					PORTD |= (1<<PD1);
+					_delay_ms(100);
+					PORTD &= ~(1<<PD1);
+					_delay_ms(100);
+				}
+				freq_select_screen();
+			} else if (cursorLocation == OPT6) {
+				home_screen();
+			}
+			break;
+}
+	
+}
+
+void option_button_press(void)	// DEFINE DESTINATION OF CURSOR AFTER OPTION BUTTON PRESSED
+{												// DEPENDANT ON CURRENT CURSOR STATE AS WELL AS SCREEN STATE
+	switch(screen){
+		case 0:		// IF SCREEN IS HOME	
+			if (cursorLocation == OPT1) {
+				set_cursor_option(2);
+			} else if (cursorLocation == OPT2) {
+				set_cursor_option(3);
+			} else if (cursorLocation == OPT3) {
+				set_cursor_option(1);
+			}
+			break;
+		case 1:		// IF SCREEN IS MANUAL
+			if (cursorLocation == OPT1) {
+				set_cursor_option(2);
+			} else if (cursorLocation == OPT2) {
+				set_cursor_option(1);
+			}
+			break;
+		case 2:		// IF SCREEN IS TIMED
+			if (cursorLocation == OPT1) {
+				set_cursor_option(2);
+			} else if (cursorLocation == OPT2) {
+				set_cursor_option(1);
+			}
+			break;
+		case 3:		// IF SCREEN IS FREQ
+			if (cursorLocation == OPT1) {
+				set_cursor_option(2);
+			} else if (cursorLocation == OPT2) {
+				set_cursor_option(3);
+			} else if (cursorLocation == OPT3) {
+				set_cursor_option(4);
+			} else if (cursorLocation == OPT4) {
+				set_cursor_option(5);
+			} else if (cursorLocation == OPT5) {
+				set_cursor_option(6);
+			} else if (cursorLocation == OPT6) {
+				set_cursor_option(1);
+			}
+			break;
+	}	
+}
+
+void scroll_button_polling(void)
+{
+	if (((PIND & (1<<PIND2)) == 0) && (counter > 0)) {		// POLL BUTTON1-PD2 ASSOCIATED WITH OPTION CURSOR CHANGE
+		counter--;
+	} else if (counter < 1000) {
+		counter++;
+	}
+	// STATE MACHINE FOR OPTION BUTTON STATE (w/ HYSTERESIS)
+	if ((counter < 400) && (optionButton == NOT_PRESSED)){		// OPTION CURSOR BUTTON STATE MACHINE
+		//PORTD |= 1<<PD0;
+		optionButton = PRESSED;
+		option_button_press();
+		
+		} else if ((counter > 600) && (optionButton == PRESSED)){
+		optionButton = NOT_PRESSED;
+		//PORTD &= ~(1<<PD0);
+	}
+}
+
+/************************************************************************************************************
+This function registers a user decision. It sends the selection signal to the screen select function.
+**************************************************************************************************************/
+void select_button_polling(void)						
+{																
+	if (((PINC & (1<<PINC5)) == 0) && (counter2 > 0)) {		// DECREMENT COUNTER2 WHEN BUTTON PRESSED 
+		counter2--;											// INCREMENT WHEN BUTTON NOT PRESSED
+	} else if (counter2 < 1000) {
+		counter2++;
+	}
+	// STATE MACHINE FOR SELECT BUTTON STATE (w/ HYSTERESIS)
+	if ((counter2 < 400) && (selectButton == NOT_PRESSED)) {
+		//PORTD |= (1<<PD0);
+		selectButton = PRESSED;
+		screen_select(screen);
+	} else if ((counter2 > 600) && (selectButton == PRESSED)) {
+		//PORTD &= ~(1<<PD0);
+		selectButton = NOT_PRESSED;
+	}
+}
+
+int main(void)
+{
+	io_init();
+	init_lcd();				//SETUP UP LCD WITH A FEW DEFAULTS	
+	
+    while (1) {
+		scroll_button_polling();
+		select_button_polling();
+	}
+}
